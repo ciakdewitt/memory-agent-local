@@ -1,14 +1,15 @@
 # Memory Agent Demo
 
-A demonstration of short-term memory capabilities using LangGraph thread-based persistence.
+A demonstration of short-term and long-term memory capabilities using LangGraph, PostgreSQL with pgvector, and vector embeddings.
 
 ## Features
 
 - Conversational agent that remembers information across sessions
-- Extracts and stores personal information shared during conversations
-- Thread-based persistence for maintaining conversation context
-- Uses Claude's LLM capabilities for natural interactions
-- Custom file-based persistence layer for reliable memory storage
+- Semantic memory search using pgvector for better recall of relevant information
+- PostgreSQL-based persistence for reliability and scalability
+- Cross-thread memory sharing for consistent user experience
+- Vector embeddings for understanding the meaning behind conversations
+- Thread management interface for organizing multiple conversations
 - Simple command-line interface for easy interaction
 
 ## Architecture
@@ -17,168 +18,383 @@ The Memory Agent is built using several key components:
 
 1. **LangGraph Framework**: For defining the agent's workflow and state management
 2. **Claude LLM**: For natural language understanding and generation
-3. **Custom Persistence Layer**: For storing conversation state between sessions
-4. **Memory Manager**: For extracting and managing user information
+3. **PostgreSQL with pgvector**: For persistent storage with vector search capabilities
+4. **Sentence Transformers**: For generating text embeddings for semantic search
+5. **Memory Manager**: For extracting and managing user information
 
-The agent maintains information in two main levels:
-- **Short-term Memory**: The full conversation history for a given thread
-- **Extracted Information**: Specific details extracted from conversations (like names, preferences, etc.)
+The agent maintains information in multiple levels:
+- **Short-term Memory**: The conversation history within a given thread
+- **Cross-thread Memory**: User information that persists across different conversation threads
+- **Vector Memory**: Semantic embeddings of past messages for contextual retrieval
+
+## Technical Implementation
+
+### Memory Architecture
+
+The system implements a multi-layered memory architecture:
+
+1. **Thread-Specific Memory**: Stores the complete conversation history and context for a specific thread
+   - Implemented using `SimpleStateSaver` for PostgreSQL persistence
+   - Each thread maintains its own independent conversation state
+
+2. **Cross-Thread Memory**: Maintains user information across different conversations
+   - Stores extracted information like name, preferences, occupation
+   - Available even when starting new conversation threads
+   - Implemented with `InMemoryStore` and namespace partitioning
+
+3. **Vector Memory**: Semantic search capabilities for retrieving contextually relevant past messages
+   - Uses pgvector for storing and searching embeddings
+   - Implemented with the SentenceTransformer model
+   - Allows the agent to find relevant past conversation regardless of exact wording
+
+### PostgreSQL with pgvector
+
+The system uses PostgreSQL with the pgvector extension for storing and retrieving conversation data:
+
+- **message_vectors table**: Stores message text and vector embeddings for semantic search
+- **simple_thread_states table**: Maintains conversation state across sessions
+- **user_threads table**: Tracks which thread is active for each user
+
+Vector embeddings enable the agent to retrieve semantically similar past messages, even when exact keywords don't match. This creates a more natural memory retrieval system.
+
+### Memory Management
+
+The `ThreadMemory` class extracts information from conversations:
+- Names (e.g., "My name is Edmond")
+- Occupations (e.g., "I am an AI Engineer")
+- Preferences (e.g., "I like sailing")
+- Contextual information (e.g., location, background)
+
+This information is stored in the database and incorporated into future conversations, available across different threads.
+
+### Message Processing Flow
+
+1. **Input Reception**: The user's message is received via the CLI interface
+2. **State Initialization**: Previous conversation state is loaded or a new one is created
+3. **Information Extraction**: The `ThreadMemory` extracts structured information from the message
+4. **Vector Embedding**: The message is embedded and stored in the vector database
+5. **Context Retrieval**: Relevant past messages are retrieved using vector similarity search
+6. **Memory-Enhanced Response**: The agent generates a response using the conversation history, extracted information, and relevant past messages
+7. **State Persistence**: The updated state is saved for future sessions
+
+### Database Schema
+
+#### message_vectors
+- `id`: Serial primary key
+- `user_id`: User identifier
+- `thread_id`: Conversation thread identifier
+- `content`: Message text content
+- `role`: Message role (user/assistant)
+- `embedding`: Vector representation (768 dimensions)
+- `created_at`: Timestamp
+
+#### simple_thread_states
+- `thread_id`: Thread identifier (primary key)
+- `state`: JSON blob containing thread state
+- `created_at`: Creation timestamp
+- `updated_at`: Last update timestamp
+
+#### user_threads
+- `user_id`: User identifier (primary key)
+- `value`: Active thread ID
+- `created_at`: Creation timestamp
+- `updated_at`: Last update timestamp
+
+## Prerequisites
+
+- Python 3.9+
+- Docker and Docker Compose (for PostgreSQL)
+- Anthropic API key (for Claude)
 
 ## Setup
 
-1. Clone this repository
-2. Create a virtual environment: `python -m venv myxagent`
-3. Activate the environment:
-   - Windows: `myxagent\Scripts\activate`
-   - macOS/Linux: `source myxagent/bin/activate`
-4. Install requirements: `pip install -r requirements.txt`
-5. Create a `.env` file with your Anthropic API key:
+### 1. Clone the repository
 
+```bash
+git clone https://github.com/yourusername/memoryagent.git
+cd memoryagent
+```
 
-## Project Structure
+### 2. Start PostgreSQL with pgvector
 
-- `src/agent/`: Agent implementation using LangGraph
-- `agent.py`: Main agent implementation with memory persistence
-- `schema.py`: Type definitions and state schema
-- `src/memory/`: Memory management components
-- `memory_manager.py`: Memory extraction and management
-- `src/model/`: Model integration and configuration
-- `claude_client.py`: Claude LLM integration
-- `config.py`: Configuration management
-- `prompts.py`: System prompts for the agent
-- `.memory/`: Directory for storing persisted memory files
-- `main.py`: Command-line interface for the memory agent
+```bash
+docker-compose up -d db
+```
 
-## Memory Persistence
+This starts:
+- PostgreSQL with pgvector extension at port 5432
 
-The agent uses a hybrid approach to memory persistence:
+### 3. Create a virtual environment
 
-1. **InMemorySaver**: For within-session state management with LangGraph
-2. **Custom File-based Persistence**: For cross-session persistence
+```bash
+python -m venv mymemory
+source mymemory/bin/activate  # On Windows: mymemory\Scripts\activate
+```
 
-Each conversation thread is stored in a JSON file in the `.memory` directory, containing:
-- Full conversation history (messages)
-- Extracted user information
-- Contextual data
+### 4. Install requirements
 
-This enables the agent to remember information across sessions, creating a more natural and personalized interaction experience.
+```bash
+pip install -r requirements.txt
+```
+
+### 5. Set up environment variables
+
+Create a `.env` file:
+
+```
+ANTHROPIC_API_KEY=your_api_key_here
+MODEL_NAME=claude-3-opus
+TEMPERATURE=0.7
+MAX_TOKENS=4096
+DATABASE_URL=postgresql://postgres:your_password@localhost:5432/memory_agent
+```
+
+### 6. Initialize the database
+
+```bash
+python fix_schema.py
+```
+
+This will:
+- Create the necessary database tables
+- Set up the pgvector extension
+- Create indices for vector similarity search
 
 ## Usage
 
-### Running the Agent
+### Running the CLI Agent
 
 ```bash
 python main.py
 ```
 
-### This will:
-
-Start the memory agent in interactive mode
-Load an existing conversation thread if one exists
-Create a new thread automatically if no previous thread is found
-Store information shared during the conversation (like your name, preferences, etc.)
-Save the thread ID for future sessions
-
-Starting a New Conversation
-bashpython main.py --new-thread
-
-
-Starting a New Conversation
-bashpython main.py --new-thread
 This will:
+- Connect to PostgreSQL for persistence
+- Load an existing conversation thread if one exists
+- Create a new thread automatically if no previous thread is found
+- Store information with vector embeddings for semantic retrieval
 
-Force the creation of a new conversation thread
-Ignore any existing saved thread
-Start with no memory of previous interactions
-Use this when you want to begin a completely fresh conversation
+### Starting a New Conversation
 
-Creating a New User Identity
-bashpython main.py --new-user
+```bash
+python main.py --new-thread
+```
+
 This will:
+- Force the creation of a new conversation thread
+- Ignore any existing saved thread
+- Start with no thread-specific memory of previous interactions
+- Cross-thread memory (like user information) will still be available
 
-Create a new user ID
-Start a fresh conversation with no previous history
-Use this when you want to simulate a completely different user
+### Managing Threads
 
-Thread Persistence Explained
+```bash
+python main.py --list-threads
+```
 
-Thread ID: Each conversation has a unique thread ID that links all interactions
-Persistence: The thread ID is saved to thread_storage.json after each session
-Memory Storage: Conversation state is saved to .memory/{thread_id}.json
-Memory Continuity:
+This will:
+- Show a list of all your conversation threads
+- Display a preview of the last message in each thread
+- Show the number of messages and last update time
+- Allow you to select which thread to continue
 
-Without --new-thread, the agent will remember details from previous sessions
-With --new-thread, the agent starts fresh with no memory of previous interactions
+### In-Conversation Commands
 
+During a conversation, you can use these commands:
+- `list`: View and select from available threads
+- `new`: Start a fresh conversation thread
+- `exit`: End the session and save the conversation
 
+## Database Querying and Monitoring
 
-Example Session
-In your first session:
-You: Hi, my name is Alex
-Agent: Nice to meet you Alex! How can I help you today?
-In a later session (same thread):
-You: Do you remember my name?
-Agent: Of course I do, Alex! How can I help you today?
-During Conversation
+You can use pgAdmin or direct SQL queries to examine the conversations and memory states stored in the database. Here are some useful queries to analyze and debug your memory agent:
 
-Type your messages and press Enter to send
-Type exit, quit, or bye to end the conversation
-Type new during a conversation to start a fresh thread immediately
+### View All Messages in a Thread
 
-Memory Extraction
-The agent automatically extracts information from conversations including:
+To see all messages in a specific conversation thread:
 
-Names (e.g., "My name is Alex")
-Preferences (e.g., "I like pizza")
-Dislikes (e.g., "I don't like coffee")
+```sql
+SELECT id, content, role, created_at
+FROM message_vectors
+WHERE thread_id = 'd6e54d45-3980-426f-9572-4b9bc399fef9'
+ORDER BY created_at;
+```
 
-This extracted information is then incorporated into future conversations, allowing the agent to refer to the user by name and remember key details about them.
+Replace the thread_id with the one you want to examine. This shows the complete conversation flow in chronological order.
 
+### Find Similar Messages Using Vector Search
 
-Implementation Details
-Custom Persistence Layer
-Instead of relying solely on LangGraph's built-in persistence, we implemented a custom file-based system to ensure reliable cross-session memory:
-pythondef save_thread_state(thread_id: str, state: Dict[str, Any]) -> None:
-    """Save thread state to a file for persistence between sessions."""
-    file_path = os.path.join(MEMORY_DIR, f"{thread_id}.json")
-    # ... serialization logic ...
+This query performs a similarity search to find messages related to a specific topic:
+
+```sql
+-- First, get an embedding for a message about the topic of interest
+WITH sample AS (
+    SELECT embedding 
+    FROM message_vectors 
+    WHERE content LIKE '%sailing%' 
+    LIMIT 1
+)
+-- Then find similar messages
+SELECT substring(content, 1, 100) as preview, role, thread_id,
+       embedding <-> (SELECT embedding FROM sample) as distance
+FROM message_vectors
+ORDER BY distance
+LIMIT 5;
+```
+
+This example finds messages similar to ones containing "sailing" using vector similarity.
+
+### View Thread States
+
+To examine the saved state of a specific thread:
+
+```sql
+SELECT thread_id, 
+       state->'memory_data'->'user_info' as user_info,
+       jsonb_array_length(state->'messages') as message_count,
+       created_at, updated_at
+FROM simple_thread_states
+WHERE thread_id = 'd6e54d45-3980-426f-9572-4b9bc399fef9';
+```
+
+This shows the extracted user information and conversation statistics for a specific thread.
+
+### Find All Threads for a User
+
+To see all threads belonging to a specific user:
+
+```sql
+SELECT DISTINCT thread_id, 
+       MIN(created_at) as first_message, 
+       MAX(created_at) as last_message,
+       COUNT(*) as message_count
+FROM message_vectors
+WHERE user_id = 'bd54eac5-1022-4a3b-984d-26fc1f1585ce'
+GROUP BY thread_id
+ORDER BY last_message DESC;
+```
+
+### Extract User Information Across Threads
+
+To see what information has been extracted about users:
+
+```sql
+SELECT thread_id, 
+       state->'memory_data'->'user_info'->>'name' as name,
+       state->'memory_data'->'user_info'->>'occupation' as occupation
+FROM simple_thread_states
+ORDER BY updated_at DESC;
+```
+
+This shows the names and occupations extracted from different conversations.
+
+### Find Messages Mentioning Specific Topics
+
+To search for messages containing specific keywords:
+
+```sql
+SELECT thread_id, substring(content, 1, 100) as preview, 
+       role, created_at
+FROM message_vectors
+WHERE content ILIKE '%sailing%' OR content ILIKE '%boat%'
+ORDER BY created_at DESC;
+```
+
+### Monitor Vector Index Performance
+
+To check if your vector index is being used efficiently:
+
+```sql
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'message_vectors';
+
+EXPLAIN ANALYZE
+SELECT id, content
+FROM message_vectors
+ORDER BY embedding <-> '[0.1,0.2,...]'::vector
+LIMIT 5;
+```
+
+Replace the vector with an actual embedding for accurate analysis.
+
+## Implementation Details
+
+### Memory Extraction
+
+The system uses pattern matching and contextual analysis to extract information from user messages. For example:
+
+```python
+# Extract name from "My name is X" pattern
+if "my name is" in message_lower:
+    name_part = message_lower.split("my name is")[1].strip()
+    name = name_part.split()[0].rstrip(',.:;!?')
+    self.update_user_info("name", name.capitalize())
+```
+
+### Vector Similarity Search
+
+Vector similarity search uses cosine similarity to find related messages:
+
+```python
+# Search for similar messages using vector similarity
+cur.execute("""
+    SELECT content, role, thread_id
+    FROM message_vectors
+    WHERE user_id = %s
+    ORDER BY embedding <-> %s::vector
+    LIMIT %s
+""", (user_id, query_embedding, limit))
+```
+
+### State Management
+
+Thread state is saved using a custom state saver that handles LangGraph message objects:
+
+```python
+def save_state(self, thread_id: str, state: Dict[str, Any]) -> None:
+    # Convert state to serializable format
+    serializable_state = self._prepare_state_for_storage(state)
     
-def load_thread_state(thread_id: str) -> Optional[Dict[str, Any]]:
-    """Load thread state from a file."""
-    file_path = os.path.join(MEMORY_DIR, f"{thread_id}.json")
-    # ... deserialization logic ...
-This approach avoids threading issues and provides more control over the stored data.
-Memory Manager
-The ThreadMemory class handles information extraction and organization:
-pythonclass ThreadMemory:
-    """A class to manage memory within a thread context."""
-    
-    def __init__(self, thread_id: str):
-        self.thread_id = thread_id
-        self.user_info = {}  # Store user details
-        self.context = []    # Store context
-        
-    def extract_info_from_message(self, message: str) -> None:
-        """Extract information from user messages."""
-        # ... extraction logic ...
-Agent State
-The agent maintains a structured state that captures all relevant information:
-pythonclass AgentState(TypedDict):
-    """State schema for the memory agent."""
-    messages: List[MessageType]  # conversation history
-    thread_id: str               # thread identifier
-    memory_data: Dict[str, Any]  # memory management data
-    input_text: Optional[str]    # input text from user
-Limitations and Future Work
+    # Store in database
+    cur.execute("""
+        INSERT INTO simple_thread_states (thread_id, state, updated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (thread_id) 
+        DO UPDATE SET state = %s, updated_at = NOW()
+    """, (thread_id, json.dumps(serializable_state), json.dumps(serializable_state)))
+```
 
-Currently only extracts basic information (names, likes, dislikes)
-No semantic search capabilities for memory retrieval
-Limited cross-thread memory (information sharing between different conversations)
-No long-term memory summarization for very long conversations
+## Implementation Challenges and Solutions
 
-Future enhancements could include:
+During development, we encountered and solved several challenges:
 
-More sophisticated information extraction
-Vector-based memory retrieval for more relevant context
-Memory consolidation for long conversations
-Integration with external knowledge bases
+1. **PostgreSQL Pipeline Mode Issues**: Errors with PostgreSQL's pipeline mode in LangGraph's PostgresStore. Solved by creating a custom saver that disables pipeline mode.
+
+2. **Vector Type Casting**: Fixed proper vector type casting for pgvector operations using `::vector` syntax.
+
+3. **Cross-Thread Memory**: Implemented robust user information extraction and retrieval to ensure information persists across conversation threads.
+
+4. **Vector Similarity Search**: Used the correct operator (`<->`) for cosine similarity search and implemented fallbacks for robustness.
+
+5. **Message Serialization**: Created custom serialization/deserialization for LangGraph message objects to ensure proper state persistence.
+
+## Future Improvements
+
+Potential enhancements for the memory agent:
+
+1. **Enhanced Information Extraction**: Implement NLP techniques for better entity extraction
+2. **RAG Integration**: Add document retrieval capabilities using the same vector storage
+3. **Memory Decay**: Implement importance-based memory decay for more human-like recall
+4. **Multi-User Support**: Enhance multi-user capabilities with role-based permissions
+5. **Web Interface**: Add a web UI for better visualization of conversations
+6. **Conversation Summarization**: Automatically generate summaries of past conversations
+7. **Emotion Recognition**: Track sentiment and emotional context across conversations
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.

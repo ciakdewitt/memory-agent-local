@@ -1,6 +1,3 @@
-### 4. Simple UI Component (src/ui/cli.py):
-
-```python
 """
 Command-line interface for the memory agent.
 """

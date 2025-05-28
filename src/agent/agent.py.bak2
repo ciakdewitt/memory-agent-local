@@ -1,0 +1,389 @@
+"""
+Memory-enabled agent implementation using LangGraph with PostgreSQL.
+"""
+
+import os
+import json
+from typing import Dict, List, Any, Optional, TypedDict, cast
+from contextlib import contextmanager
+import uuid
+
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.store.postgres import PostgresStore
+from sentence_transformers import SentenceTransformer
+
+from src.model.claude_client import get_claude_client
+from src.model.prompts import create_memory_agent_prompt, enhance_prompt_with_memory
+from src.memory.memory_manager import ThreadMemory
+from src.model.config import get_model_config, get_langgraph_config
+from src.agent.schema import (
+    AgentState, MemoryData, AgentConfig, MessageType,
+    NODE_INITIALIZE, NODE_PROCESS_INPUT, NODE_GENERATE_RESPONSE
+)
+from src.database.db import get_db_connection
+from src.utils.thread_utils import (
+    get_all_threads, 
+    load_thread_id, 
+    save_thread_id,
+    MEMORY_DIR
+)
+
+# Re-export the functions needed by the API
+__all__ = [
+    "run_agent", 
+    "get_all_threads", 
+    "load_thread_id", 
+    "save_thread_id", 
+    "load_thread_state", 
+    "save_thread_state"
+]
+
+# Initialize database connection
+try:
+    conn = get_db_connection()
+    print("Connected to PostgreSQL database")
+    
+    # Initialize checkpointer with PostgreSQL
+    checkpointer = PostgresSaver(conn)
+    checkpointer.setup()
+    print("PostgreSQL checkpointer set up successfully")
+    
+    # Initialize store with embeddings for semantic search
+    embedding_model = SentenceTransformer("sentence-transformers/all-distilroberta-v1")
+    embedding_dimension = 768  # Depends on the specific model
+    
+    # Create store with vector search capability
+    memory_store = PostgresStore(
+        conn, 
+        index={
+            "embed": lambda text: embedding_model.encode(text).tolist(),
+            "dims": embedding_dimension,
+            "fields": ["$"]  # Index all fields
+        }
+    )
+    memory_store.setup()
+    print("PostgreSQL store with vector search set up successfully")
+
+except Exception as e:
+    print(f"Error setting up PostgreSQL: {str(e)}")
+    print("Falling back to in-memory storage")
+    # Fallback to in-memory storage if PostgreSQL setup fails
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.store.memory import InMemoryStore
+    
+    checkpointer = InMemorySaver()
+    memory_store = InMemoryStore()
+
+# Define namespace format for memory storage
+def get_memory_namespace(user_id: str):
+    """Get namespace for user memory."""
+    return (user_id, "memories")
+
+# Modify run_agent to use PostgreSQL storage
+def run_agent(user_input: str, thread_id: Optional[str] = None, user_id: Optional[str] = None):
+    """
+    Run the memory agent with the given input.
+    
+    Args:
+        user_input: The user's message
+        thread_id: Optional thread ID for continuing a conversation
+        user_id: Optional user ID for cross-thread memory
+        
+    Returns:
+        The agent's response and the thread ID
+    """
+    agent = create_memory_agent()
+    
+    # Use the provided thread_id or generate a new one
+    current_thread_id = thread_id or str(uuid.uuid4())
+    print(f"DEBUG: Running agent with thread_id={current_thread_id}")
+    
+    # Prepare config with thread_id in the configurable section
+    config = {"configurable": {"thread_id": current_thread_id}}
+    
+    # Add user_id to config if provided
+    if user_id:
+        config["configurable"]["user_id"] = user_id
+    
+    # Create initial state
+    initial_state = {
+        "thread_id": current_thread_id,
+        "input_text": user_input,
+        "messages": [],
+        "memory_data": {"user_info": {}, "context": []}
+    }
+    
+    # If we're using PostgreSQL, we don't need to manually load the state
+    # as LangGraph will handle it via the checkpoint system
+    # Just invoke with the new input
+    
+    # Run the agent
+    print(f"DEBUG: Invoking agent with input: {initial_state}")
+    result = agent.invoke(initial_state, config=config)
+    print(f"DEBUG: Agent result keys: {list(result.keys())}")
+    
+    # No need to manually save state with PostgreSQL checkpointer
+    # as LangGraph handles this automatically
+    
+    # Store user information in cross-thread memory if we have a user_id
+    if user_id and "memory_data" in result and "user_info" in result["memory_data"]:
+        user_info = result["memory_data"]["user_info"]
+        if user_info:
+            namespace = get_memory_namespace(user_id)
+            memory_store.put(namespace, "user_info", user_info)
+    
+    # Extract the response (last message content)
+    messages = result["messages"]
+    if messages and len(messages) > 0:
+        last_message = messages[-1]
+        response = last_message.content
+    else:
+        response = "No response generated."
+    
+    return response, current_thread_id
+
+# Function to create the agent (this remains mostly the same)
+def create_memory_agent():
+    """
+    Create a memory-enabled agent using LangGraph.
+    
+    Returns:
+        A runnable agent graph
+    """
+    # Initialize the language model
+    claude = get_claude_client()
+    base_system_prompt = create_memory_agent_prompt()
+    
+    # Define the agent nodes
+    def initialize_state(state: Dict[str, Any], config: Dict[str, Any] = None, *, store=None) -> Dict[str, Any]:
+        """Initialize or load the agent state."""
+        print(f"DEBUG: initialize_state received keys: {list(state.keys())}")
+        
+        # Get user_id from config if available
+        user_id = config["configurable"].get("user_id") if config and "configurable" in config else None
+        
+        # Create a new state with defaults and overrides from input state
+        new_state = {
+            "thread_id": state.get("thread_id", str(uuid.uuid4())),
+            "messages": state.get("messages", []),
+            "memory_data": state.get("memory_data", {"user_info": {}, "context": []}),
+            "input_text": state.get("input_text", "")
+        }
+        
+        # If we have a user_id and store, try to load user info from cross-thread memory
+        if user_id and store:
+            namespace = get_memory_namespace(user_id)
+            try:
+                user_info_item = store.get(namespace, "user_info")
+                if user_info_item:
+                    # Merge with existing user_info, prioritizing existing values
+                    stored_user_info = user_info_item.value
+                    current_user_info = new_state["memory_data"]["user_info"]
+                    
+                    # Start with stored info and override with current info
+                    merged_user_info = {**stored_user_info, **current_user_info}
+                    new_state["memory_data"]["user_info"] = merged_user_info
+            except Exception as e:
+                print(f"DEBUG: Error loading user info from store: {str(e)}")
+        
+        print(f"DEBUG: initialize_state returned keys: {list(new_state.keys())}")
+        return new_state
+    
+    # Inside process_input function
+    def process_input(state: Dict[str, Any], config: Dict[str, Any] = None, *, store=None) -> Dict[str, Any]:
+        """Process user input and update memory if needed."""
+        print(f"DEBUG: process_input received keys: {list(state.keys())}")
+    
+        try:
+            # Get the input text
+            input_text = state.get("input_text", "")
+            if not input_text:
+                print("DEBUG: No input text found in state")
+                return state  # No input to process
+        
+            # Create new state to avoid modifying the original
+            new_state = state.copy()
+        
+            # Add the user message to conversation history
+            new_state["messages"] = state.get("messages", []) + [HumanMessage(content=input_text)]
+        
+            # Create memory manager to extract information
+            memory = ThreadMemory(state.get("thread_id", str(uuid.uuid4())))
+            memory.user_info = state.get("memory_data", {}).get("user_info", {})
+            memory.context = state.get("memory_data", {}).get("context", [])
+        
+            # Extract information from the message
+            memory.extract_info_from_message(input_text)
+        
+            # Update memory in the state
+            new_state["memory_data"] = {
+                "user_info": memory.user_info,
+                "context": memory.context
+            }
+        
+            # Store message for vector search if store is available
+            if store and config and "configurable" in config:
+                user_id = config["configurable"].get("user_id")
+                if user_id:
+                    print(f"DEBUG: Attempting to store message for user_id: {user_id}")
+                    namespace = get_memory_namespace(user_id)
+                    try:
+                        # Store message with metadata for retrieval
+                        print(f"DEBUG: Storing message with namespace: {namespace}")
+                        store.put(
+                            namespace,
+                            f"msg_{uuid.uuid4()}",
+                            {
+                                "content": input_text,
+                                "role": "user",
+                                "thread_id": new_state["thread_id"],
+                                "extracted_info": memory.user_info
+                            },
+                            index=["content"]  # Index the content for semantic search
+                        )
+                        print("DEBUG: Successfully stored message in vector store")
+                    except Exception as e:
+                        print(f"DEBUG: Error storing message: {str(e)}")
+            else:
+                print(f"DEBUG: Not storing message. store={store is not None}, config with configurable={config and 'configurable' in config}, user_id={(config and 'configurable' in config and config['configurable'].get('user_id'))}")
+        
+            print(f"DEBUG: process_input returned with user_info: {memory.user_info}")
+            return new_state
+        except Exception as e:
+            print(f"DEBUG: Error in process_input: {str(e)}")
+        # Return original state if there's an error
+        return state
+    
+    def generate_response(state: Dict[str, Any], config: Dict[str, Any] = None, *, store=None) -> Dict[str, Any]:
+        """Generate a response using Claude with memory context."""
+        print(f"DEBUG: generate_response received keys: {list(state.keys())}")
+        
+        new_state = state.copy()
+        
+        # Create memory manager to get memory summary
+        memory = ThreadMemory(state.get("thread_id", str(uuid.uuid4())))
+        memory.user_info = state.get("memory_data", {}).get("user_info", {})
+        memory.context = state.get("memory_data", {}).get("context", [])
+        
+        # Get memory context from thread-specific memory
+        memory_context = memory.get_memory_summary()
+        
+        # Get additional context from vector store if available
+        additional_context = ""
+        if store and config and "configurable" in config:
+            user_id = config["configurable"].get("user_id")
+            if user_id and state.get("input_text"):
+                namespace = get_memory_namespace(user_id)
+                try:
+                    # Search for relevant memories using semantic search
+                    memories = store.search(
+                        namespace,
+                        query=state.get("input_text", ""),
+                        limit=3
+                    )
+                    
+                    if memories:
+                        additional_context = "\nRelevant past information:\n"
+                        for memory_item in memories:
+                            if memory_item.value.get("content") and memory_item.value.get("role") == "user":
+                                additional_context += f"- User said: {memory_item.value['content']}\n"
+                except Exception as e:
+                    print(f"DEBUG: Error searching memories: {str(e)}")
+        
+        # Combine thread memory with vector search results
+        if additional_context:
+            memory_context = f"{memory_context}\n{additional_context}"
+        
+        print(f"DEBUG: Memory context: {memory_context}")
+        
+        # Use the enhance_prompt_with_memory function 
+        enhanced_system_prompt = enhance_prompt_with_memory(base_system_prompt, memory_context)
+        
+        model_messages = [SystemMessage(content=enhanced_system_prompt)]
+        
+        # Add conversation history
+        for msg in state.get("messages", []):
+            model_messages.append(msg)
+        
+        print(f"DEBUG: Sending {len(model_messages)} messages to Claude")
+        
+        # Get response from Claude
+        response = claude.invoke(model_messages)
+        
+        # Add the assistant's response to the conversation
+        new_state["messages"] = state.get("messages", []) + [AIMessage(content=response.content)]
+        
+        # Store assistant message in vector store if available
+        if store and config and "configurable" in config:
+            user_id = config["configurable"].get("user_id")
+            if user_id:
+                namespace = get_memory_namespace(user_id)
+                # Store message for future reference
+                store.put(
+                    namespace,
+                    f"msg_{uuid.uuid4()}",
+                    {
+                        "content": response.content,
+                        "role": "assistant",
+                        "thread_id": new_state["thread_id"]
+                    },
+                    index=["content"]  # Index the content for semantic search
+                )
+        
+        return new_state
+    
+    # Create the graph
+    workflow = StateGraph(AgentState)
+    
+    # Add nodes
+    workflow.add_node(NODE_INITIALIZE, initialize_state)
+    workflow.add_node(NODE_PROCESS_INPUT, process_input)
+    workflow.add_node(NODE_GENERATE_RESPONSE, generate_response)
+    
+    # Add edges
+    workflow.set_entry_point(NODE_INITIALIZE)
+    workflow.add_edge(NODE_INITIALIZE, NODE_PROCESS_INPUT)
+    workflow.add_edge(NODE_PROCESS_INPUT, NODE_GENERATE_RESPONSE)
+    workflow.add_edge(NODE_GENERATE_RESPONSE, END)
+    
+    # Compile the graph with both checkpointer and store
+    memory_agent = workflow.compile(checkpointer=checkpointer, store=memory_store)
+    
+    return memory_agent
+
+# Legacy functions for backward compatibility (can be removed later)
+def load_thread_state(thread_id: str) -> Optional[Dict[str, Any]]:
+    """Load thread state using the PostgreSQL checkpointer."""
+    # This now just serves as a compatibility layer
+    # Real state loading is handled by LangGraph's PostgresSaver
+    
+    # Create a temporary graph to access the state
+    agent = create_memory_agent()
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    try:
+        # Try to get state using LangGraph's built-in methods
+        state_snapshot = agent.get_state(config)
+        if state_snapshot:
+            return state_snapshot.values
+    except Exception as e:
+        print(f"DEBUG: Error loading state from PostgreSQL: {str(e)}")
+    
+    # Fallback to file-based method if needed
+    file_path = os.path.join(MEMORY_DIR, f"{thread_id}.json")
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"DEBUG: Error loading thread state from file: {str(e)}")
+    
+    return None
+
+def save_thread_state(thread_id: str, state: Dict[str, Any]) -> None:
+    """Save thread state (compatibility method, not needed with PostgreSQL)."""
+    # This is now just a no-op as PostgreSQL checkpointer handles saving automatically
+    # Keep for backward compatibility with code that might call this
+    pass

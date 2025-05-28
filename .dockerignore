@@ -1,0 +1,38 @@
+# Virtual environment
+mymemory/
+venv/
+env/
+.venv/
+
+# Git
+.git
+.gitignore
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env
+
+# Memory storage (will be mounted as volumes)
+.memory/
+storage/
+
+# IDE files
+.idea/
+.vscode/
+
+# Logs
+*.log
+logs/
+
+# Docker files (to avoid recursive copying)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Documentation
+README.md
+LICENSE

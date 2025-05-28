@@ -73,36 +73,52 @@ class ThreadMemory:
     def extract_info_from_message(self, message: str) -> None:
         """
         Extract information from a user message to update memory.
-        
-        This is a simple implementation that could be expanded with
-        more sophisticated NLP techniques.
-        
+    
+        Enhanced version that recognizes more patterns.
+    
         Args:
             message: The user's message text
         """
-        # Extract name if mentioned
         message_lower = message.lower()
-        
-        # Simple name extraction
+    
+        # Extract name if mentioned
         if "my name is" in message_lower:
             name_part = message_lower.split("my name is")[1].strip()
-            # Get the first word after "my name is"
-            name = name_part.split()[0].capitalize()
-            self.update_user_info("name", name)
+            # Get the first word after "my name is" - remove punctuation
+            name = name_part.split()[0].rstrip(',.:;!?')
+            self.update_user_info("name", name.capitalize())
+        elif "i am " in message_lower and len(message_lower.split("i am ")) > 1:
+            # Try to extract name from "I am [Name]" pattern
+            name_part = message_lower.split("i am ")[1].strip()
+            if not any(job in name_part for job in ["developer", "engineer", "student", "working", "employee"]):
+                name = name_part.split()[0].rstrip(',.:;!?')
+                if name and len(name) > 2:  # Avoid short words that aren't names
+                    self.update_user_info("name", name.capitalize())
+    
+        # Extract job/occupation - improved pattern matching
+        job_patterns = [
+            "i am a", "i'm a", 
+            "i am an", "i'm an",
+            "i work as", "my job is", 
+            "my profession is"
+        ]
+    
+        for pattern in job_patterns:
+            if pattern in message_lower:
+                job_part = message_lower.split(pattern)[1].strip()
+                if "." in job_part:
+                    job = job_part.split(".")[0].strip()
+                elif "," in job_part:
+                    job = job_part.split(",")[0].strip()
+                else:
+                    job = job_part.split()[0] + " " + (job_part.split()[1] if len(job_part.split()) > 1 else "")
             
-        # Extract preferences if mentioned
-        if "i like" in message_lower:
-            like_part = message_lower.split("i like")[1].strip()
-            # Get the phrase after "I like"
-            preference = like_part.split(".")[0].strip()
-            self.update_user_info("likes", preference)
-            
-        # Extract dislikes if mentioned
-        if "i don't like" in message_lower or "i dont like" in message_lower:
-            if "i don't like" in message_lower:
-                dislike_part = message_lower.split("i don't like")[1].strip()
+                self.update_user_info("occupation", job)
+                break
+    
+        # Special case for direct occupation statements
+        if "i am software engineer" in message_lower or "i am an ai engineer" in message_lower:
+            if "ai engineer" in message_lower:
+                self.update_user_info("occupation", "AI Engineer")
             else:
-                dislike_part = message_lower.split("i dont like")[1].strip()
-            # Get the phrase after "I don't like"
-            dislike = dislike_part.split(".")[0].strip()
-            self.update_user_info("dislikes", dislike)
+                self.update_user_info("occupation", "Software Engineer")
